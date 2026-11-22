@@ -1,7 +1,12 @@
 # Custom Smart Island build: applies smartisland-custom.patch (no INTERNET / location / calendar permissions + edge light)
-# and builds an installable debug APK. Run it by hand from the Actions tab ("Run workflow").
+# and builds an optimized, signed RELEASE APK (much smoother than a debug build).
+# Run it by hand from the Actions tab ("Run workflow").
 #
 # Put this file at .github/workflows/build-custom.yml and smartisland-custom.patch at the root of the repository.
+#
+# Signing: a private key is created on the first run and kept in the GitHub Actions cache, so later builds are signed
+# with the same key and install over the previous one without uninstalling. GitHub deletes caches that are not used
+# for 7 days; if that happens a new key is created and you have to uninstall the old app once (use its Backup first).
 
 name: Build custom APK
 
@@ -13,9 +18,9 @@ permissions:
 
 jobs:
   build:
-    name: Apply patch and build debug APK
+    name: Apply patch and build release APK
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 45
 
     steps:
       - name: Check out repository
@@ -34,25 +39,51 @@ jobs:
           java-version: "17"
           cache: gradle
 
+      - name: Restore signing key
+        id: keycache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/custom-signing
+          key: custom-signing-key-v1
+
+      - name: Create signing key (first run only)
+        if: steps.keycache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p "$RUNNER_TEMP/custom-signing"
+          keytool -genkeypair -keystore "$RUNNER_TEMP/custom-signing/custom.jks" \
+            -storepass changeit -keypass changeit -alias custom \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -dname "CN=Smart Island Custom"
+
+      - name: Use signing key in Gradle
+        run: |
+          test -f "$RUNNER_TEMP/custom-signing/custom.jks"
+          echo "SIGNING_STORE_FILE=$RUNNER_TEMP/custom-signing/custom.jks" >> "$GITHUB_ENV"
+          echo "SIGNING_STORE_PASSWORD=changeit" >> "$GITHUB_ENV"
+          echo "SIGNING_KEY_ALIAS=custom" >> "$GITHUB_ENV"
+          echo "SIGNING_KEY_PASSWORD=changeit" >> "$GITHUB_ENV"
+
       - name: Make Gradle executable
         run: chmod +x ./gradlew
 
       # No lint or tests on purpose: only what is needed to get an APK.
-      - name: Build debug APK
-        run: ./gradlew --no-daemon --stacktrace assembleDebug
+      - name: Build signed release APK
+        run: ./gradlew --no-daemon --stacktrace assembleRelease
 
       # Prints the permissions the built APK really declares, so you can check there is no INTERNET in it.
-      - name: Show permissions of the built APK
+      - name: Show permissions and signature of the built APK
         continue-on-error: true
         run: |
-          AAPT2="$(ls -d "$ANDROID_HOME"/build-tools/*/aapt2 | sort -V | tail -1)"
-          echo "Using $AAPT2"
-          "$AAPT2" dump permissions app/build/outputs/apk/debug/app-debug.apk
+          APK=app/build/outputs/apk/release/app-release.apk
+          BT="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)"
+          echo "Using $BT"
+          "$BT/aapt2" dump permissions "$APK"
+          "$BT/apksigner" verify --print-certs "$APK"
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: SmartIsland-Custom-apk
-          path: app/build/outputs/apk/debug/app-debug.apk
+          path: app/build/outputs/apk/release/app-release.apk
           if-no-files-found: error
           retention-days: 30
