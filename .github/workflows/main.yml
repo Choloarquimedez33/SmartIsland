@@ -1,0 +1,272 @@
+diff --git a/app/src/main/AndroidManifest.xml b/app/src/main/AndroidManifest.xml
+index fef0a56..5553cd2 100644
+--- a/app/src/main/AndroidManifest.xml
++++ b/app/src/main/AndroidManifest.xml
+@@ -8,7 +8,7 @@
+ <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+     xmlns:tools="http://schemas.android.com/tools">
+ 
+-    <uses-permission android:name="android.permission.INTERNET" />
++    <!-- Custom build: INTERNET, location and calendar permissions removed on purpose (no network access at all). -->
+     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+@@ -37,11 +37,8 @@
+     <uses-permission android:name="com.android.alarm.permission.SET_ALARM" />
+     <!-- Lets the app appear in "Do Not Disturb access": the mode idle widget reads which mode (Bedtime, Driving, ...) is on. Nothing is changed. -->
+     <uses-permission android:name="android.permission.ACCESS_NOTIFICATION_POLICY" />
+-    <uses-permission android:name="android.permission.READ_CALENDAR" />
+     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+-    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+-    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+     <uses-permission android:name="android.permission.BLUETOOTH" />
+     <!-- Lets the call card mute the mic and switch earpiece / speaker / Bluetooth for apps whose call
+          notification has no such buttons. A normal permission, granted at install. -->
+diff --git a/app/src/main/java/com/agupta07505/smartisland/service/EdgeGlowOverlay.kt b/app/src/main/java/com/agupta07505/smartisland/service/EdgeGlowOverlay.kt
+new file mode 100644
+index 0000000..083450b
+--- /dev/null
++++ b/app/src/main/java/com/agupta07505/smartisland/service/EdgeGlowOverlay.kt
+@@ -0,0 +1,189 @@
++/*
++ * Smart Island (custom build)
++ * Edge light: a neon light that runs around the screen border when a notification arrives
++ * (inspired by the Edge Lighting of older Samsung phones).
++ * Licensed under the GNU GPL v3 License, like the rest of the project.
++ */
++
++package com.agupta07505.smartisland.service
++
++import android.animation.Animator
++import android.animation.AnimatorListenerAdapter
++import android.animation.ValueAnimator
++import android.content.Context
++import android.graphics.Canvas
++import android.graphics.Color
++import android.graphics.Matrix
++import android.graphics.Paint
++import android.graphics.PixelFormat
++import android.graphics.RectF
++import android.graphics.SweepGradient
++import android.os.Build
++import android.view.Gravity
++import android.view.RoundedCorner
++import android.view.View
++import android.view.WindowManager
++import android.view.animation.LinearInterpolator
++import kotlin.math.PI
++import kotlin.math.sin
++
++/**
++ * Draws a short, click-through light animation along the edge of the screen. It never takes touches or focus and removes
++ * its window as soon as the animation ends, so nothing stays on top of other apps.
++ *
++ * Must be created with the accessibility service as [context]: the window type below only exists for that service.
++ */
++class EdgeGlowOverlay(private val context: Context) {
++    private val windowManager = context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
++    private var glowView: GlowView? = null
++
++    /** Plays the light once. A light that is still running is replaced by a new one. */
++    fun flash() {
++        release()
++        val view = GlowView(context) { release() }
++        val params = WindowManager.LayoutParams(
++            WindowManager.LayoutParams.MATCH_PARENT,
++            WindowManager.LayoutParams.MATCH_PARENT,
++            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
++            WINDOW_FLAGS,
++            PixelFormat.TRANSLUCENT
++        ).apply {
++            gravity = Gravity.TOP or Gravity.START
++            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
++                layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
++            }
++        }
++        try {
++            windowManager.addView(view, params)
++            glowView = view
++            view.start()
++        } catch (e: Exception) {
++            glowView = null
++            android.util.Log.w(TAG, "Edge light could not be shown", e)
++        }
++    }
++
++    /** Stops the light and removes its window. Safe to call at any time. */
++    fun release() {
++        val view = glowView ?: return
++        glowView = null
++        view.stop()
++        try {
++            windowManager.removeViewImmediate(view)
++        } catch (e: Exception) {
++            android.util.Log.w(TAG, "Edge light window was already gone", e)
++        }
++    }
++
++    private class GlowView(context: Context, private val onDone: () -> Unit) : View(context) {
++        private val density = resources.displayMetrics.density
++        private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE }
++        private val rect = RectF()
++        private val shaderMatrix = Matrix()
++        private var shader: SweepGradient? = null
++        private var shaderWidth = 0
++        private var shaderHeight = 0
++        private var progress = 0f
++        private var finished = false
++
++        private val animator = ValueAnimator.ofFloat(0f, 1f).apply {
++            duration = DURATION_MS
++            interpolator = LinearInterpolator()
++            addUpdateListener {
++                progress = it.animatedValue as Float
++                invalidate()
++            }
++            addListener(object : AnimatorListenerAdapter() {
++                override fun onAnimationEnd(animation: Animator) {
++                    finish()
++                }
++            })
++        }
++
++        fun start() {
++            animator.start()
++        }
++
++        fun stop() {
++            finished = true
++            animator.cancel()
++        }
++
++        private fun finish() {
++            if (finished) return
++            finished = true
++            onDone()
++        }
++
++        override fun onDraw(canvas: Canvas) {
++            val w = width.toFloat()
++            val h = height.toFloat()
++            if (w <= 0f || h <= 0f) return
++            val sweep = ensureShader(w, h)
++            // Fades in and out over the whole animation.
++            val envelope = sin(PI * progress).toFloat().coerceIn(0f, 1f)
++            // The bright part of the gradient travels around the border.
++            shaderMatrix.setRotate(progress * 360f * TURNS, w / 2f, h / 2f)
++            sweep.setLocalMatrix(shaderMatrix)
++            paint.shader = sweep
++
++            val radius = cornerRadius()
++            rect.set(0f, 0f, w, h)
++            // Wide and faint first, thin and bright last. Half of every stroke is outside the screen, so only the inner half shows.
++            for (i in LAYER_WIDTH_DP.indices) {
++                paint.strokeWidth = LAYER_WIDTH_DP[i] * density
++                paint.alpha = (255f * LAYER_ALPHA[i] * envelope).toInt().coerceIn(0, 255)
++                canvas.drawRoundRect(rect, radius, radius, paint)
++            }
++        }
++
++        private fun ensureShader(w: Float, h: Float): SweepGradient {
++            val current = shader
++            if (current != null && shaderWidth == w.toInt() && shaderHeight == h.toInt()) return current
++            val created = SweepGradient(w / 2f, h / 2f, GRADIENT_COLORS, GRADIENT_POSITIONS)
++            shader = created
++            shaderWidth = w.toInt()
++            shaderHeight = h.toInt()
++            return created
++        }
++
++        private fun cornerRadius(): Float {
++            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
++                val corner = rootWindowInsets?.getRoundedCorner(RoundedCorner.POSITION_TOP_LEFT)
++                if (corner != null && corner.radius > 0) return corner.radius.toFloat()
++            }
++            return DEFAULT_CORNER_DP * density
++        }
++    }
++
++    private companion object {
++        const val TAG = "EdgeGlowOverlay"
++
++        // ---- Easy knobs: change these to taste ----
++        /** How long the light lasts. */
++        const val DURATION_MS = 1800L
++        /** How many laps the bright part makes around the screen. */
++        const val TURNS = 2f
++        /** Used when the phone does not report its screen corner radius (Android 12+ does). */
++        const val DEFAULT_CORNER_DP = 40f
++        val NEON_CYAN = Color.parseColor("#00E5FF")
++        val NEON_BLUE = Color.parseColor("#2979FF")
++        val FAINT_CYAN = Color.argb(0x22, 0x00, 0xE5, 0xFF)
++        // -------------------------------------------
++
++        // Full stroke widths in dp (only the inner half is visible) and how strong each layer is, outermost first.
++        val LAYER_WIDTH_DP = floatArrayOf(36f, 24f, 14f, 8f, 4f)
++        val LAYER_ALPHA = floatArrayOf(0.10f, 0.16f, 0.30f, 0.55f, 1.0f)
++
++        // Faint at the back, bright cyan, then neon blue at the head of the light, then a sharp drop.
++        val GRADIENT_COLORS = intArrayOf(FAINT_CYAN, NEON_CYAN, NEON_BLUE, FAINT_CYAN)
++        val GRADIENT_POSITIONS = floatArrayOf(0f, 0.6f, 0.85f, 1f)
++
++        const val WINDOW_FLAGS =
++            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
++                WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
++                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
++                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
++                WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED
++    }
++}
+diff --git a/app/src/main/java/com/agupta07505/smartisland/service/SmartIslandOverlayService.kt b/app/src/main/java/com/agupta07505/smartisland/service/SmartIslandOverlayService.kt
+index ab633eb..a96d92e 100644
+--- a/app/src/main/java/com/agupta07505/smartisland/service/SmartIslandOverlayService.kt
++++ b/app/src/main/java/com/agupta07505/smartisland/service/SmartIslandOverlayService.kt
+@@ -88,6 +88,8 @@ class SmartIslandOverlayService : AccessibilityService() {
+     private var widgetWindowJob: kotlinx.coroutines.Job? = null
+     private var collapseJob: kotlinx.coroutines.Job? = null
+     private var lastParams: WindowManager.LayoutParams? = null
++    // Custom build: neon light along the screen edge when a notification or call arrives.
++    private var edgeGlow: EdgeGlowOverlay? = null
+ 
+     private val torchCallback = object : android.hardware.camera2.CameraManager.TorchCallback() {
+         override fun onTorchModeChanged(cameraId: String, enabled: Boolean) {
+@@ -1012,6 +1014,29 @@ class SmartIslandOverlayService : AccessibilityService() {
+             }
+         }
+ 
++        serviceScope.launch {
++            runSuspendCatchingLogged(TAG, "Edge light collector failed") {
++                // Maps each message / call card to the time it was posted, so a new one (or a fresh message in an old chat) lights the edge.
++                var seen: Map<String, Long>? = null
++                notificationRepository.notifications.collect { list ->
++                    if (destroyed) return@collect
++                    val current = list
++                        .filter {
++                            it.mode == com.agupta07505.smartisland.model.IslandMode.Notification ||
++                                it.mode == com.agupta07505.smartisland.model.IslandMode.IncomingCall
++                        }
++                        .associate { it.key to it.timeMillis }
++                    val previous = seen
++                    seen = current
++                    // The first list is whatever was already there when the service started: no light for it.
++                    if (previous != null && current.any { (key, time) -> previous[key] != time }) {
++                        val glow = edgeGlow ?: EdgeGlowOverlay(this@SmartIslandOverlayService).also { edgeGlow = it }
++                        glow.flash()
++                    }
++                }
++            }
++        }
++
+         serviceScope.launch {
+             runSuspendCatchingLogged(TAG, "Effective-settings collector failed") {
+                 // Fires when the user edits a profile or the phone rotates and the other profile applies.
+@@ -1107,6 +1132,8 @@ class SmartIslandOverlayService : AccessibilityService() {
+         com.agupta07505.smartisland.util.SystemAnimScale.stop(this)
+         unregisterRotationListener()
+         serviceScope.cancel()
++        edgeGlow?.release()
++        edgeGlow = null
+         windowHandler.removeCallbacks(windowRefreshRunnable)
+         windowHandler.removeCallbacks(settleScanRunnable)
+         windowRefreshPending = false
